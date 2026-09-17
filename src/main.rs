@@ -141,8 +141,11 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     // Start watching before listing existing files so nothing slips through in between.
     let (fs_tx, fs_rx) = mpsc::channel();
     let mut watcher = notify::recommended_watcher(fs_tx)?;
-    let mode = if args.recursive { RecursiveMode::Recursive } else { RecursiveMode::NonRecursive };
-    watcher.watch(&dir, mode)?;
+    if args.recursive {
+        watch_recursive(&mut watcher, &dir)?;
+    } else {
+        watcher.watch(&dir, RecursiveMode::NonRecursive)?;
+    }
 
     let (update_tx, update_rx) = mpsc::channel();
     let (window, wake) = (ui.window, ui.atoms.WAKE);
@@ -164,6 +167,26 @@ fn run(args: Args) -> Result<(), Box<dyn Error>> {
     ui.run(&update_rx)
 }
 
+/// Watches `dir` and its subdirectories, skipping subdirectories that can't be watched, e.g. for
+/// lack of permission. (notify alone gives up on the whole tree at the first one.)
+fn watch_recursive(watcher: &mut impl Watcher, dir: &Path) -> notify::Result<()> {
+    let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) else { return Ok(()) };
+    if matches!(e.kind, notify::ErrorKind::MaxFilesWatch) || e.paths.iter().any(|p| p == dir) {
+        return Err(e);
+    }
+    // A subdirectory failed. `dir` itself is watched by then, so retry its subdirectories one by one.
+    // Those failing for any reason but the watch limit are skipped.
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir())
+            && let Err(e) = watch_recursive(watcher, &entry.path())
+            && matches!(e.kind, notify::ErrorKind::MaxFilesWatch)
+        {
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 fn is_image(path: &Path) -> bool {
     ImageFormat::from_path(path).is_ok_and(|format| format.reading_enabled())
 }
@@ -176,7 +199,7 @@ fn load(path: &Path) -> Result<RgbaImage, Box<dyn Error>> {
     Ok(image.into_rgba8())
 }
 
-/// Images already in `dir`, least recently modified first.
+/// Images already in `dir` that we are allowed to read, least recently modified first.
 fn existing_images(dir: &Path, recursive: bool) -> Vec<PathBuf> {
     fn collect(dir: &Path, recursive: bool, found: &mut Vec<(SystemTime, PathBuf)>) {
         let Ok(entries) = fs::read_dir(dir) else { return };
@@ -186,7 +209,7 @@ fn existing_images(dir: &Path, recursive: bool) -> Vec<PathBuf> {
                 if recursive {
                     collect(&path, recursive, found);
                 }
-            } else if is_image(&path) {
+            } else if is_image(&path) && fs::File::open(&path).is_ok() {
                 let time = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                 found.push((time, path));
             }
